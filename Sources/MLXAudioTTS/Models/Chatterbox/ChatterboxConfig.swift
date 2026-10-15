@@ -328,6 +328,11 @@ public struct ChatterboxConfiguration: Codable, Sendable {
     public var decCondLen: Int
     public var modelPath: String?
 
+    // Multilingual markers from config.json (V2/V3 checkpoints); nil on older configs.
+    public var t3Model: String?
+    public var multilingual: Bool?
+    public var textPreprocessing: String?
+
     // S3Gen decoder config
     public var meanflow: Bool
     public var decoderInChannels: Int
@@ -347,6 +352,15 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         modelType == "chatterbox_turbo" || t3Config.isGPT
     }
 
+    /// Whether text goes through the Multilingual V3 pipeline (full case + NFKD).
+    /// Mirrors Python `ModelConfig.from_dict`: a missing `text_preprocessing` defaults by `t3_model`.
+    public var usesV3TextPreprocessing: Bool {
+        if let textPreprocessing {
+            return textPreprocessing.lowercased() == "nfkd,fullcase"
+        }
+        return t3Model?.lowercased() == "v3"
+    }
+
     enum CodingKeys: String, CodingKey {
         case modelType = "model_type"
         case t3Config = "t3_config"
@@ -360,6 +374,9 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         case decCondLen = "dec_cond_len"
         case decCondLenSeconds = "dec_cond_len_seconds"
         case modelPath = "model_path"
+        case t3Model = "t3_model"
+        case multilingual
+        case textPreprocessing = "text_preprocessing"
         case meanflow
         case decoderInChannels = "decoder_in_channels"
         case decoderOutChannels = "decoder_out_channels"
@@ -382,6 +399,9 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         encCondLen: Int = 6 * 16000,
         decCondLen: Int = 10 * 24000,
         modelPath: String? = nil,
+        t3Model: String? = nil,
+        multilingual: Bool? = nil,
+        textPreprocessing: String? = nil,
         meanflow: Bool = true,
         decoderInChannels: Int = 320,
         decoderOutChannels: Int = 80,
@@ -402,6 +422,9 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         self.encCondLen = encCondLen
         self.decCondLen = decCondLen
         self.modelPath = modelPath
+        self.t3Model = t3Model
+        self.multilingual = multilingual
+        self.textPreprocessing = textPreprocessing
         self.meanflow = meanflow
         self.decoderInChannels = decoderInChannels
         self.decoderOutChannels = decoderOutChannels
@@ -455,6 +478,9 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         }
 
         self.modelPath = try container.decodeIfPresent(String.self, forKey: .modelPath)
+        self.t3Model = try container.decodeIfPresent(String.self, forKey: .t3Model)
+        self.multilingual = try container.decodeIfPresent(Bool.self, forKey: .multilingual)
+        self.textPreprocessing = try container.decodeIfPresent(String.self, forKey: .textPreprocessing)
 
         // S3Gen decoder config
         // meanflow=true for Turbo (distilled flow matching), false for Regular (ODE solver with CFG)
@@ -491,6 +517,9 @@ public struct ChatterboxConfiguration: Codable, Sendable {
         try container.encode(encCondLen, forKey: .encCondLen)
         try container.encode(decCondLen, forKey: .decCondLen)
         try container.encodeIfPresent(modelPath, forKey: .modelPath)
+        try container.encodeIfPresent(t3Model, forKey: .t3Model)
+        try container.encodeIfPresent(multilingual, forKey: .multilingual)
+        try container.encodeIfPresent(textPreprocessing, forKey: .textPreprocessing)
         try container.encode(meanflow, forKey: .meanflow)
         try container.encode(decoderInChannels, forKey: .decoderInChannels)
         try container.encode(decoderOutChannels, forKey: .decoderOutChannels)

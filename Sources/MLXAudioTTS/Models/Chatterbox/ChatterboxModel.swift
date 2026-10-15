@@ -84,6 +84,9 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
     /// Model directory (for loading auxiliary files).
     private var modelDir: URL?
 
+    /// Cangjie table for V3 Chinese text, loaded from `modelDir` on first use.
+    private var cangjieConverter: ChatterboxCangjieConverter?
+
     /// Configurable CFG weight for T3 inference (0.0-1.0). Only used by Regular model.
     /// Set from the host app to override the default 0.5.
     public var cfgWeightOverride: Float?
@@ -462,9 +465,24 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
     // MARK: - Text Tokenization
 
     /// Tokenize text into token IDs for T3.
-    func tokenizeText(_ text: String) throws -> MLXArray {
+    func tokenizeText(_ text: String, language: String? = nil) throws -> MLXArray {
         guard let tokenizer = tokenizer else {
             throw AudioGenerationError.modelNotInitialized("Tokenizer not loaded")
+        }
+
+        if !config.meanflow && config.usesV3TextPreprocessing {
+            let lang = (language ?? "en").lowercased()
+            guard chatterboxSupportedLanguages.contains(lang) else {
+                let supported = chatterboxSupportedLanguages.sorted().joined(separator: ", ")
+                throw AudioGenerationError.invalidInput(
+                    "Unsupported language code '\(lang)'. Supported languages: \(supported)")
+            }
+            if lang == "zh", cangjieConverter == nil, let modelDir {
+                cangjieConverter = ChatterboxCangjieConverter(modelDir: modelDir)
+            }
+            let prepared = prepareV3Text(text, language: lang, cangjie: cangjieConverter)
+            let encoded = chatterboxEncode(prepared, tokenizer: tokenizer)
+            return MLXArray([Int32(sotToken)] + encoded.map { Int32($0) } + [Int32(eotToken)])
         }
 
         if config.meanflow {
@@ -728,7 +746,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         }
 
         // Tokenize text
-        let textTokens = try tokenizeText(text)
+        let textTokens = try tokenizeText(text, language: language)
         print("[Chatterbox] Text tokenized: \(textTokens.shape)")
 
         let temperature = generationParameters.temperature
