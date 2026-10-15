@@ -750,6 +750,15 @@ class CausalConditionalCFM: Module {
         return x
     }
 
+    static let regularNoiseFrames = 50 * 300
+
+    /// Python's `mx.random.seed(0); mx.random.normal((1, 80, 50 * 300))`: seed(0) then one draw uses the
+    /// second half of split(key(0)). Drawn whole (values depend on the shape) from an explicit key, so
+    /// the global RNG is left alone.
+    static func regularNoise() -> MLXArray {
+        MLXRandom.normal([1, 80, regularNoiseFrames], key: MLXRandom.split(key: MLXRandom.key(0)).1)
+    }
+
     func callAsFunction(
         mu: MLXArray, mask: MLXArray, nTimesteps: Int,
         spks: MLXArray? = nil, cond: MLXArray? = nil,
@@ -768,12 +777,10 @@ class CausalConditionalCFM: Module {
                 }
             }
             z = noise
+        } else if mu.dim(2) <= Self.regularNoiseFrames {
+            // Regular: mlx-audio Python's fixed seed-0 buffer, so output matches it.
+            z = Self.regularNoise()[0..., 0..., ..<mu.dim(2)]
         } else {
-            // Regular: match the ResembleAI reference, which draws FRESH noise every
-            // call (`z = torch.randn_like(mu)`, with `self.rand_noise = None`). The
-            // mlx-audio port instead froze a seed-0 buffer, stamping one draw's
-            // spectral idiosyncrasy on every output (and every take). Fresh noise
-            // matches the reference and restores natural take-to-take variation.
             z = MLXRandom.normal(mu.shape)
         }
 

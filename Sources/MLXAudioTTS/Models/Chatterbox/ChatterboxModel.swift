@@ -285,6 +285,13 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             with: "up_blocks.$1.",
             options: .regularExpression)
 
+        // Conformer encoder layers too (`encoders_0` → `encoders.0`); unmapped, they were silently
+        // dropped and all 10 layers ran on random init.
+        k = k.replacingOccurrences(
+            of: #"^encoder\.(up_)?encoders_(\d+)\."#,
+            with: "encoder.$1encoders.$2.",
+            options: .regularExpression)
+
         // --- 2. Transformer array naming within blocks ---
         // Python: `transformer_0.` → Swift: `transformer_blocks.0.`
         k = k.replacingOccurrences(
@@ -845,9 +852,9 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
 
         // Post-process: remove OOV tokens and append silence
         let cleanTokens = dropInvalidTokens(speechTokens)
-        // Append 3 silence tokens (S3GEN_SIL = 4299) to reduce artifacts at end
-        let silenceTokens = MLXArray([Int32(4299), Int32(4299), Int32(4299)])
-        let finalTokens = MLX.concatenated([cleanTokens, silenceTokens])
+        // Turbo appends 3 silence tokens (S3GEN_SIL = 4299) against end artifacts; Regular Python doesn't.
+        let finalTokens = config.isTurbo
+            ? MLX.concatenated([cleanTokens, MLXArray([Int32(4299), Int32(4299), Int32(4299)])]) : cleanTokens
 
         // Stage 2: S3Gen — speech tokens → mel → waveform
         let tokenArr = finalTokens.reshaped([1, -1])

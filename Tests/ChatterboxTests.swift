@@ -4,6 +4,7 @@ import MLXAudioCore
 import Testing
 import Tokenizers
 
+@testable import MLXAudioCodecs
 @testable import MLXAudioTTS
 
 @Suite("Chatterbox generation tests")
@@ -265,6 +266,15 @@ struct ChatterboxResampleTests {
     }
 }
 
+@Suite("Chatterbox flow noise tests")
+struct ChatterboxFlowNoiseTests {
+    @Test func regularNoiseIsMLXAudioPythonsSeedZeroBuffer() throws {
+        let head = try #require(try mediaArrays("chatterbox_v3_s3gen")["flow_noise_head"])
+        let ours = CausalConditionalCFM.regularNoise()[0..., 0..., ..<head.dim(2)]
+        #expect(MLX.allClose(ours, head, rtol: 0, atol: 1e-6).item(Bool.self))
+    }
+}
+
 @Suite("Chatterbox sampling tests")
 struct ChatterboxSamplingTests {
     // A token at 7% of the top token's probability: mlx-audio keeps it at min-p 0.05, T 0.8;
@@ -462,6 +472,53 @@ struct ChatterboxOfflineModelTests {
             filterLogits(logits: x, temperature: 0.8, minP: 0.05, temperatureLast: true) .> MLXArray(-Float.infinity)
         }
         #expect(MLX.all(kept(guided) .== kept(expected)).item(Bool.self))
+    }
+
+    @Test func everyCheckpointWeightReachesAParameter() async throws {
+        // update(verify: []) drops unmatched keys silently; the S3Gen encoder once ran on random init that way.
+        let fixture = try await offlineFixture.value
+        let checkpoint = try MLX.loadArrays(url: try #require(v3ModelDir).appendingPathComponent("model.safetensors"))
+        let weights = Set(fixture.model.sanitize(weights: checkpoint).keys)
+        let parameters = Set(fixture.model.parameters().flattened().map(\.0))
+
+        #expect(weights.subtracting(parameters).sorted() == [])
+        // Computed at init, Turbo-only, or affine-free BatchNorm.
+        let unfilled = parameters.subtracting(weights).filter { !$0.hasSuffix("attn1.to_out.0.bias") }.sorted()
+        #expect(unfilled == [
+            "s3gen.decoder.estimator.time_embed_mixer.weight",
+            "s3gen.encoder.embed.pos_enc.pe",
+            "s3gen.encoder.up_embed.pos_enc.pe",
+            "s3gen.mel2wav.stftWindow",
+            "s3gen.speaker_encoder.dense.nonlinear.0.bias",
+            "s3gen.speaker_encoder.dense.nonlinear.0.weight",
+        ])
+    }
+
+    @Test func s3genMatchesMLXAudioPython() async throws {
+        let fixture = try await offlineFixture.value
+        let python = try mediaArrays("chatterbox_v3_s3gen")
+        let tokens = try #require(python["speech_tokens"])
+        let expectedMel = try #require(python["mel"])
+        let expectedWav = try #require(python["wav"]).asType(.float32)
+        let c = fixture.conditionals
+
+        let mel = fixture.model.s3gen.inference(
+            token: tokens, tokenLen: MLXArray([Int32(tokens.dim(1))]),
+            promptToken: c.s3genPromptToken, promptTokenLen: MLXArray([Int32(c.s3genPromptToken.dim(1))]),
+            promptFeat: c.s3genPromptFeat, embedding: c.xVector, nTimesteps: 10)
+        #expect(mel.shape == expectedMel.shape)
+        let melCos = cosine(mel, expectedMel)
+        let melDiff = MLX.abs(mel - expectedMel).max().item(Float.self)
+
+        // Same seed and call order as the fixture, so the vocoder's sine phases and noise match too.
+        MLXRandom.seed(123)
+        let (wav, _) = fixture.model.s3gen.vocoder(expectedMel)
+        let flat = wav.reshaped([-1])
+        #expect(flat.dim(0) == expectedWav.reshaped([-1]).dim(0))
+        let wavCos = cosine(flat, expectedWav)
+        #expect(melCos > 0.99999)
+        #expect(melDiff < 0.1)
+        #expect(wavCos > 0.999)
     }
 
     @Test func generationIsDeterministicAcrossSavedConditionals() async throws {
