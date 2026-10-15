@@ -796,7 +796,8 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             && (t3Cond.condPromptSpeechTokens?.dim(1) ?? 0) > 0
         let maxTokens: Int
         if hasPromptTokens {
-            maxTokens = config.t3Config.maxSpeechTokens
+            // Regular: mlx-audio Python's generate caps at 1000 (~40 s) so a missed EOS can't run away.
+            maxTokens = config.isTurbo ? config.t3Config.maxSpeechTokens : min(config.t3Config.maxSpeechTokens, 1000)
         } else {
             // Estimate: ~10 speech tokens per text token, with min 200, max 768
             let textLen = textTokens.dim(textTokens.ndim - 1)

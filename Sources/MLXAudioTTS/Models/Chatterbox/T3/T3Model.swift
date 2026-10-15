@@ -365,16 +365,9 @@ public class T3Model: Module {
     ///   - repetitionPenalty: Repetition penalty factor.
     ///   - cfgWeight: Classifier-free guidance weight.
     /// - Returns: Generated speech tokens (1, T).
-    public func inference(
-        t3Cond: inout T3Cond,
-        textTokens: MLXArray,
-        maxNewTokens: Int = 1024,
-        temperature: Float = 0.8,
-        topP: Float = 0.95,
-        minP: Float = 0.05,
-        repetitionPenalty: Float = 1.2,
-        cfgWeight: Float = 0.5
-    ) -> MLXArray {
+    /// Runs the prompt through the transformer: `[cond | text | BOS | BOS]`, as mlx-audio Python builds it.
+    /// Returns the last hidden states (CFG batch of 2 when `cfgWeight > 0`) and the filled cache.
+    func prefill(t3Cond: inout T3Cond, textTokens: MLXArray, cfgWeight: Float) -> (hidden: MLXArray, cache: [KVCache]) {
         var tokens = textTokens
         if tokens.ndim == 1 {
             tokens = tokens.expandedDimensions(axis: 0)
@@ -416,15 +409,29 @@ public class T3Model: Module {
             bosEmbed = MLX.concatenated([bosEmbed, bosEmbed], axis: 0)
         }
 
-        // Initial input: [conditioning | text | BOS]
-        let inputEmbeddings = MLX.concatenated([condEmbForInput, textEmbResult, bosEmbed], axis: 1)
+        // Python's prepare_input_embeds adds the speech BOS, then inference appends a second
+        // position-0 BOS; with one, the speech-token distribution differs (longer pauses).
+        let inputEmbeddings = MLX.concatenated([condEmbForInput, textEmbResult, bosEmbed, bosEmbed], axis: 1)
 
-        // Create KV cache
         let cache = makeCache()
-
-        // Initial forward pass to fill cache
-        var hidden = tfmr(inputEmbeddings, cache: cache)
+        let hidden = tfmr(inputEmbeddings, cache: cache)
         eval(hidden)
+        return (hidden, cache)
+    }
+
+    public func inference(
+        t3Cond: inout T3Cond,
+        textTokens: MLXArray,
+        maxNewTokens: Int = 1024,
+        temperature: Float = 0.8,
+        topP: Float = 0.95,
+        minP: Float = 0.05,
+        repetitionPenalty: Float = 1.2,
+        cfgWeight: Float = 0.5
+    ) -> MLXArray {
+        let prefilled = prefill(t3Cond: &t3Cond, textTokens: textTokens, cfgWeight: cfgWeight)
+        var hidden = prefilled.hidden
+        let cache = prefilled.cache
 
         // Track generated tokens
         var generatedIds = [hp.startSpeechToken]
@@ -454,7 +461,8 @@ public class T3Model: Module {
             }
 
             // Sample (temperature + min-p + top-p)
-            let nextToken = sampleToken(logits: logits, temperature: temperature, topP: topP, minP: minP)
+            let nextToken = sampleToken(
+                logits: logits, temperature: temperature, topP: topP, minP: minP, temperatureLast: true)
             eval(nextToken)
             let nextTokenId = nextToken[0].item(Int.self)
 
@@ -536,11 +544,25 @@ func applyRepetitionPenalty(logits: MLXArray, generatedIds: [Int], penalty: Floa
 /// Matches the Python implementation: operates on logits throughout,
 /// then uses categorical (which applies softmax internally) to sample.
 /// Shared by both T3Model (LLaMA) and T3GPT2Model (Turbo).
-func sampleToken(logits: MLXArray, temperature: Float, topK: Int = 0, topP: Float = 1.0, minP: Float = 0.0) -> MLXArray {
+/// `temperatureLast` follows mlx-audio's sampler (Regular model): filter on raw logits, then temper.
+/// Tempering first makes min-p stricter (keeps p ≥ 0.09·max instead of 0.05·max at T 0.8).
+func sampleToken(
+    logits: MLXArray, temperature: Float, topK: Int = 0, topP: Float = 1.0, minP: Float = 0.0,
+    temperatureLast: Bool = false
+) -> MLXArray {
+    MLXRandom.categorical(
+        filterLogits(logits: logits, temperature: temperature, topK: topK, topP: topP, minP: minP, temperatureLast: temperatureLast))
+}
+
+/// The logits `sampleToken` draws from; filtered-out tokens are -inf.
+func filterLogits(
+    logits: MLXArray, temperature: Float, topK: Int = 0, topP: Float = 1.0, minP: Float = 0.0,
+    temperatureLast: Bool = false
+) -> MLXArray {
     var filtered = logits
 
     // 1. Temperature scaling (on logits)
-    if temperature > 0 && temperature != 1.0 {
+    if !temperatureLast && temperature > 0 && temperature != 1.0 {
         filtered = filtered / MLXArray(temperature)
     }
 
@@ -597,6 +619,8 @@ func sampleToken(logits: MLXArray, temperature: Float, topK: Int = 0, topP: Floa
         filtered = takeAlong(maskedSorted, inverseIndices, axis: -1)
     }
 
-    // 5. Sample using categorical (applies softmax internally on logits)
-    return MLXRandom.categorical(filtered)
+    if temperatureLast && temperature > 0 && temperature != 1.0 {
+        filtered = filtered / MLXArray(temperature)
+    }
+    return filtered
 }

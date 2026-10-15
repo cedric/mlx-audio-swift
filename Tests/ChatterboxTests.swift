@@ -265,6 +265,28 @@ struct ChatterboxResampleTests {
     }
 }
 
+@Suite("Chatterbox sampling tests")
+struct ChatterboxSamplingTests {
+    // A token at 7% of the top token's probability: mlx-audio keeps it at min-p 0.05, T 0.8;
+    // tempering first would drop it (0.07^1.25 < 0.05).
+    private let logits = MLXArray([0, log(Float(0.07)), log(Float(0.01))]).reshaped([1, 3])
+
+    @Test func minPFiltersBeforeTemperatureLikeMLXAudio() {
+        let kept = filterLogits(logits: logits, temperature: 0.8, minP: 0.05, temperatureLast: true) .> MLXArray(-Float.infinity)
+        #expect(kept.asArray(Bool.self) == [true, true, false])
+    }
+
+    @Test func temperatureFirstStaysTheDefault() {
+        let kept = filterLogits(logits: logits, temperature: 0.8, minP: 0.05) .> MLXArray(-Float.infinity)
+        #expect(kept.asArray(Bool.self) == [true, false, false])
+    }
+
+    @Test func temperatureLastStillScalesKeptLogits() {
+        let filtered = filterLogits(logits: logits, temperature: 0.8, minP: 0.05, temperatureLast: true)
+        #expect(abs(filtered[0, 1].item(Float.self) - log(Float(0.07)) / 0.8) < 1e-5)
+    }
+}
+
 @Suite("Chatterbox conditionals tests")
 struct ChatterboxConditionalsTests {
     @Test func saveLoadRoundTripsSyntheticArrays() throws {
@@ -410,6 +432,36 @@ struct ChatterboxOfflineModelTests {
         #expect(s3Tokens == 1)
         #expect(swift.s3genPromptFeat.shape == feat.shape)
         #expect(MLX.allClose(swift.s3genPromptFeat, feat, rtol: 1e-3, atol: 1e-3).item(Bool.self))
+    }
+
+    @Test func firstStepLogitsMatchMLXAudioPython() async throws {
+        let fixture = try await offlineFixture.value
+        let python = try mediaArrays("chatterbox_v3_first_step")
+        let t3 = try #require(fixture.model.t3 as? T3Model)
+        let c = fixture.conditionals
+
+        // Keep the text in step with FIRST_STEP_TEXT in scripts/make_chatterbox_parity_fixtures.py.
+        let tokens = try fixture.model.tokenizeText("Hello there, this is a test.", language: "en")
+        let pythonTokens = try #require(python["text_tokens"])
+        let promptLength = try #require(python["prompt_length"]).item(Int.self)
+        let expected = try #require(python["logits"])
+        #expect(tokens.reshaped([-1]).asArray(Int32.self) == pythonTokens.asArray(Int32.self))
+
+        var cond = T3Cond(
+            speakerEmb: c.speakerEmb, condPromptSpeechTokens: c.t3PromptSpeechTokens, condPromptSpeechEmb: nil,
+            emotionAdv: MLXArray(Float(0.5)))
+        let (hidden, cache) = t3.prefill(t3Cond: &cond, textTokens: tokens, cfgWeight: 0.5)
+        #expect(cache.first?.offset == promptLength)
+        let logits = t3.speechHead(hidden[0..., (-1)..., 0...]).squeezed(axis: 1)
+        let guided = logits[0 ..< 1] + 0.5 * (logits[0 ..< 1] - logits[1 ..< 2])
+
+        #expect(cosine(guided, expected) > 0.9999)
+        #expect(guided.argMax(axis: -1).item(Int.self) == expected.argMax(axis: -1).item(Int.self))
+        // Same candidate set after min-p, so sampling draws from the same tokens.
+        func kept(_ x: MLXArray) -> MLXArray {
+            filterLogits(logits: x, temperature: 0.8, minP: 0.05, temperatureLast: true) .> MLXArray(-Float.infinity)
+        }
+        #expect(MLX.all(kept(guided) .== kept(expected)).item(Bool.self))
     }
 
     @Test func generationIsDeterministicAcrossSavedConditionals() async throws {
