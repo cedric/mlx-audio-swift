@@ -520,6 +520,20 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
 
     // MARK: - Reference Audio Processing
 
+    /// The VoiceEncoder speaker embedding (1, 256), L2-normalised, of a mono clip at any rate: the one Regular
+    /// conditioning stores. The cosine of two of these is the speaker similarity mlx-audio's QA uses.
+    public func speakerEmbedding(audio: MLXArray, sampleRate: Int) -> MLXArray {
+        let mono = audio.ndim > 1 ? audio.mean(axis: 0) : audio
+        return voiceEncoderEmbedding(resampleAudio(mono, fromSR: sampleRate, toSR: ChatterboxConstants.s3SampleRate))
+    }
+
+    /// Silence trimmed as librosa.effects.trim(top_db=20), then partials at Python's rate (Regular).
+    private func voiceEncoderEmbedding(_ audio16k: MLXArray) -> MLXArray {
+        let trimmed = trimSilence(audio16k, topDb: 20.0)
+        let mels = voiceEncoderMelSpectrogram(trimmed, isTurbo: config.isTurbo).transposed().expandedDimensions(axis: 0)
+        return voiceEncoder.inference(mels: mels, melLens: [mels.dim(1)], rate: config.isTurbo ? nil : 1.3)
+    }
+
     /// Computes the conditioning for a reference clip. Reusable across `generate` calls and storable
     /// via `ChatterboxConditionals.save(to:)`.
     public func prepareConditionals(
@@ -564,18 +578,8 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             audio24kTrunc, fromSR: ChatterboxConstants.s3genSampleRate, toSR: ChatterboxConstants.s3SampleRate)
 
         // --- 1. VoiceEncoder: 256-dim speaker embedding for T3 ---
-        // Trim silence before computing speaker embedding (matches Python librosa.effects.trim)
         // Python Regular embeds the full clip, Turbo only its first encCondLen.
-        let veInput = config.isTurbo ? audio16kEnc : audio16kFull
-        let audio16kTrimmed = trimSilence(veInput, topDb: 20.0)
-        chatterboxLogger.debug("VoiceEncoder: trimmed \(veInput.dim(0)) → \(audio16kTrimmed.dim(0)) samples")
-        let veMels = voiceEncoderMelSpectrogram(audio16kTrimmed, isTurbo: config.isTurbo)
-        let veMelsTransposed = veMels.transposed().expandedDimensions(axis: 0)
-        let speakerEmb = voiceEncoder.inference(
-            mels: veMelsTransposed,
-            melLens: [veMelsTransposed.dim(1)],
-            rate: config.isTurbo ? nil : 1.3
-        )
+        let speakerEmb = voiceEncoderEmbedding(config.isTurbo ? audio16kEnc : audio16kFull)
         // No eval() here — defer to single eval below for GPU pipelining
 
         // --- 2. S3TokenizerV2: speech token IDs for T3 and S3Gen ---

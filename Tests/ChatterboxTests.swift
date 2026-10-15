@@ -474,6 +474,15 @@ struct ChatterboxOfflineModelTests {
         #expect(MLX.all(kept(guided) .== kept(expected)).item(Bool.self))
     }
 
+    @Test func speakerEmbeddingIsTheConditioningsOne() async throws {
+        let fixture = try await offlineFixture.value
+        let wav = try #require(
+            Bundle.module.url(forResource: "conversational_a", withExtension: "wav", subdirectory: "media"))
+        let (_, audio) = try loadAudioArray(from: wav, sampleRate: fixture.model.sampleRate)
+        let embedding = fixture.model.speakerEmbedding(audio: audio, sampleRate: fixture.model.sampleRate)
+        #expect(MLX.allClose(embedding, fixture.conditionals.speakerEmb, rtol: 0, atol: 1e-6).item(Bool.self))
+    }
+
     @Test func everyCheckpointWeightReachesAParameter() async throws {
         // update(verify: []) drops unmatched keys silently; the S3Gen encoder once ran on random init that way.
         let fixture = try await offlineFixture.value
