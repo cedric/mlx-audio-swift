@@ -162,9 +162,12 @@ public class VoiceEncoder: Module {
         mels: MLXArray,
         melLens: [Int],
         overlap: Float = 0.5,
+        rate: Float? = nil,
         minCoverage: Float = 0.8
     ) -> MLXArray {
-        let frameStep = Int(round(Float(hp.vePartialFrames) * (1 - overlap)))
+        // Python's get_frame_step: a rate (partials per second) overrides overlap.
+        let frameStep = rate.map { Int(round(Float(hp.sampleRate) / $0 / Float(hp.vePartialFrames))) }
+            ?? Int(round(Float(hp.vePartialFrames) * (1 - overlap)))
 
         var nPartialsList = [Int]()
         var targetLens = [Int]()

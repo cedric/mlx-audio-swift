@@ -543,7 +543,8 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         let decCondLen = config.decCondLen
         let audio24kTrunc = audio24k.dim(0) > decCondLen ? audio24k[..<decCondLen] : audio24k
 
-        // 16kHz for S3TokenizerV2, CAMPPlus, VoiceEncoder — single resample, derive all variants
+        // 16kHz as in mlx-audio Python: T3 tokens from the first encCondLen; S3Gen tokens and
+        // the x-vector from the 24k decCondLen clip resampled (not a slice: edges differ).
         let audio16kFull: MLXArray
         if refAudioSR != ChatterboxConstants.s3SampleRate {
             audio16kFull = resampleAudio(audio, fromSR: refAudioSR, toSR: ChatterboxConstants.s3SampleRate)
@@ -552,23 +553,21 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         }
         let encCondLen = config.encCondLen
         let audio16kEnc = audio16kFull.dim(0) > encCondLen ? audio16kFull[..<encCondLen] : audio16kFull
-
-        // Derive 16kHz for S3Gen tokenizer/CAMPPlus from the already-resampled 16k audio.
-        // This is equivalent to resampling audio24kTrunc 24k→16k, but avoids a second
-        // expensive polyphase resample. The 16k equivalent of decCondLen (24k) samples:
-        let decCondLen16k = (decCondLen * ChatterboxConstants.s3SampleRate) / ChatterboxConstants.s3genSampleRate
-        let audio16kFromDec = audio16kFull.dim(0) > decCondLen16k
-            ? audio16kFull[..<decCondLen16k] : audio16kFull
+        let audio16kFromDec = resampleAudio(
+            audio24kTrunc, fromSR: ChatterboxConstants.s3genSampleRate, toSR: ChatterboxConstants.s3SampleRate)
 
         // --- 1. VoiceEncoder: 256-dim speaker embedding for T3 ---
         // Trim silence before computing speaker embedding (matches Python librosa.effects.trim)
-        let audio16kTrimmed = trimSilence(audio16kEnc, topDb: 20.0)
-        chatterboxLogger.debug("VoiceEncoder: trimmed \(audio16kEnc.dim(0)) → \(audio16kTrimmed.dim(0)) samples")
+        // Python Regular embeds the full clip, Turbo only its first encCondLen.
+        let veInput = config.isTurbo ? audio16kEnc : audio16kFull
+        let audio16kTrimmed = trimSilence(veInput, topDb: 20.0)
+        chatterboxLogger.debug("VoiceEncoder: trimmed \(veInput.dim(0)) → \(audio16kTrimmed.dim(0)) samples")
         let veMels = voiceEncoderMelSpectrogram(audio16kTrimmed, isTurbo: config.isTurbo)
         let veMelsTransposed = veMels.transposed().expandedDimensions(axis: 0)
         let speakerEmb = voiceEncoder.inference(
             mels: veMelsTransposed,
-            melLens: [veMelsTransposed.dim(1)]
+            melLens: [veMelsTransposed.dim(1)],
+            rate: config.isTurbo ? nil : 1.3
         )
         // No eval() here — defer to single eval below for GPU pipelining
 
@@ -576,9 +575,13 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         let t3PromptSpeechTokens: MLXArray
         let s3genPromptToken: MLXArray
 
+        let isTurbo = config.isTurbo
+        func tokenizerMel(_ audio: MLXArray) -> MLXArray {
+            isTurbo ? s3TokenizerLogMelSpectrogram(audio) : chatterboxTokenizerLogMel(audio)
+        }
         if let s3tok = s3Tokenizer {
             // T3 tokens: from encCondLen audio at 16kHz
-            let t3Mel = s3TokenizerLogMelSpectrogram(audio16kEnc) // (128, T)
+            let t3Mel = tokenizerMel(audio16kEnc) // (128, T)
             let t3MelBatch = t3Mel.expandedDimensions(axis: 0) // (1, 128, T)
             let t3MelLen = MLXArray([Int32(t3Mel.dim(1))])
             let (t3Tokens, _) = s3tok(t3MelBatch, melLen: t3MelLen)
@@ -589,7 +592,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             t3PromptSpeechTokens = t3Tokens[0..., ..<min(plen, t3Tokens.dim(1))]
 
             // S3Gen tokens: from decCondLen audio
-            let s3genMel = s3TokenizerLogMelSpectrogram(audio16kFromDec)
+            let s3genMel = tokenizerMel(audio16kFromDec)
             let s3genMelBatch = s3genMel.expandedDimensions(axis: 0)
             let s3genMelLen = MLXArray([Int32(s3genMel.dim(1))])
             let (s3genTokens, _) = s3tok(s3genMelBatch, melLen: s3genMelLen)
@@ -1188,27 +1191,26 @@ private func loadChatterboxWeights(modelDir: URL) throws -> [String: MLXArray] {
     return allWeights
 }
 
+// MARK: - S3 Tokenizer Mel
+
+/// mlx-audio Python's chatterbox/s3tokenizer mel, not the codec one: symmetric Hann window and the
+/// last STFT frame dropped (torch.stft parity). Either difference flips speech tokens.
+private func chatterboxTokenizerLogMel(_ audio: MLXArray) -> MLXArray {
+    let freqs = stft(audio: audio, window: hanningWindow(size: 400), nFft: 400, hopLength: 160)
+    let magnitudes = MLX.abs(freqs[..<(freqs.dim(0) - 1)]).square() // (T', 201)
+    let filters = melFilters(sampleRate: 16000, nFft: 400, nMels: 128, norm: "slaney", melScale: .slaney)
+    var logSpec = MLX.log10(MLX.maximum(matmul(magnitudes, filters), MLXArray(Float(1e-10))))
+    logSpec = MLX.maximum(logSpec, logSpec.max() - 8.0)
+    return ((logSpec + 4.0) / 4.0).transposed() // (128, T')
+}
+
 // MARK: - Audio Resampling
 
-/// Polyphase FIR audio resampling with proper anti-aliasing.
-///
-/// Matches the quality of `scipy.signal.resample_poly` / `librosa.resample`:
-/// designs a windowed-sinc lowpass FIR filter, upsamples, filters, and downsamples.
-/// This prevents aliasing artifacts that occur with naive linear interpolation.
-///
-/// Uses a polyphase decomposition for efficiency: the FIR filter is split into
-/// `up` sub-filters (phases), and only the relevant phase is evaluated per output sample.
-/// Audio samples are bulk-extracted via `asArray()` for fast CPU-side computation.
+/// mlx-audio Python's resampler; conditioning parity depends on it.
 private func resampleAudio(_ audio: MLXArray, fromSR: Int, toSR: Int) -> MLXArray {
     guard fromSR != toSR else { return audio }
-    // Chatterbox conditioning (24k prompt mel features, 16k x-vector + tokenizer)
-    // must match the PyTorch reference so the CAMPPlus speaker x-vector agrees.
-    // The previous Kaiser resampler cut at Nyquist (rolloff 1.0) and left ~+14 dB of
-    // excess 7-8 kHz energy vs torchaudio's Resample, corrupting the x-vector
-    // (cos ~0.64 to the reference) and making regular Chatterbox output audibly
-    // brighter/edgier. `sincResampleAudio` matches torchaudio exactly (Hann window,
-    // width 6, rolloff 0.99).
-    return sincResampleAudio(audio.reshaped([-1]), from: fromSR, to: toSR)
+    let samples = audio.reshaped([-1]).asType(.float32).asArray(Float.self)
+    return MLXArray(kaiserBestResample(samples, from: fromSR, to: toSR))
 }
 
 /// Modified Bessel function of the first kind, order 0.

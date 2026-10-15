@@ -223,6 +223,48 @@ private let offlineFixture = Task<OfflineChatterboxFixture, Error> {
         model: model, conditionals: conditionals, folderBefore: before, folderAfter: after)
 }
 
+// MARK: - Python conditioning parity
+
+/// Keep in step with `synthetic` in scripts/make_chatterbox_parity_fixtures.py.
+private func syntheticSignal(count: Int, rate: Int) -> [Float] {
+    (0 ..< count).map { n in
+        let t = Double(n) / Double(rate)
+        let noise = Double((n * 7919) % 101) / 50.0 - 1.0
+        return Float(0.5 * sin(2 * .pi * 440 * t) + 0.3 * sin(2 * .pi * 7900 * t) + 0.1 * noise)
+    }
+}
+
+private func mediaArrays(_ name: String) throws -> [String: MLXArray] {
+    let url = try #require(Bundle.module.url(forResource: name, withExtension: "safetensors", subdirectory: "media"))
+    return try MLX.loadArrays(url: url)
+}
+
+private func cosine(_ a: MLXArray, _ b: MLXArray) -> Float {
+    let a = a.reshaped([-1]), b = b.reshaped([-1])
+    return ((a * b).sum() / (MLX.sqrt((a * a).sum()) * MLX.sqrt((b * b).sum()))).item(Float.self)
+}
+
+private func sameFraction(_ a: MLXArray, _ b: MLXArray) -> Float {
+    guard a.shape == b.shape, a.size > 0 else { return 0 }
+    return (a .== b).asType(.float32).mean().item(Float.self)
+}
+
+@Suite("Chatterbox resample tests")
+struct ChatterboxResampleTests {
+    @Test(arguments: [(24000, 16000, 4801), (44100, 24000, 4410)])
+    func matchesMLXAudioPython(source: Int, target: Int, count: Int) throws {
+        let expected = try #require(try mediaArrays("chatterbox_resample_golden")["\(source)_\(target)"])
+        let actual = MLXArray(kaiserBestResample(syntheticSignal(count: count, rate: source), from: source, to: target))
+        #expect(actual.shape == expected.shape)
+        #expect(MLX.abs(actual - expected).max().item(Float.self) < 1e-5)
+    }
+
+    @Test func sameRateIsIdentity() {
+        let x: [Float] = [0.1, -0.2, 0.3]
+        #expect(kaiserBestResample(x, from: 24000, to: 24000) == x)
+    }
+}
+
 @Suite("Chatterbox conditionals tests")
 struct ChatterboxConditionalsTests {
     @Test func saveLoadRoundTripsSyntheticArrays() throws {
@@ -349,6 +391,25 @@ struct ChatterboxOfflineModelTests {
         expectEqual(c.xVector, loaded.xVector, "xVector")
         expectEqual(c.s3genPromptToken, loaded.s3genPromptToken, "s3gen tokens")
         expectEqual(c.s3genPromptFeat, loaded.s3genPromptFeat, "s3gen feat")
+    }
+
+    @Test func conditionalsMatchMLXAudioPython() async throws {
+        let fixture = try await offlineFixture.value
+        let python = try mediaArrays("chatterbox_v3_conds_conversational_a")
+        let swift = fixture.conditionals
+
+        let speaker = cosine(swift.speakerEmb, try #require(python["t3.speaker_emb"]))
+        let xVector = cosine(swift.xVector, try #require(python["gen.embedding"]))
+        let t3Tokens = sameFraction(swift.t3PromptSpeechTokens, try #require(python["t3.cond_prompt_speech_tokens"]))
+        let s3Tokens = sameFraction(swift.s3genPromptToken, try #require(python["gen.prompt_token"]))
+        let feat = try #require(python["gen.prompt_feat"])
+
+        #expect(speaker > 0.9999)
+        #expect(xVector > 0.9999)
+        #expect(t3Tokens == 1)
+        #expect(s3Tokens == 1)
+        #expect(swift.s3genPromptFeat.shape == feat.shape)
+        #expect(MLX.allClose(swift.s3genPromptFeat, feat, rtol: 1e-3, atol: 1e-3).item(Bool.self))
     }
 
     @Test func generationIsDeterministicAcrossSavedConditionals() async throws {
