@@ -10,13 +10,17 @@
 
 import AVFoundation
 import Foundation
+import Hub
 import HuggingFace
 @preconcurrency import MLX
 import MLXAudioCodecs
 import MLXAudioCore
 import MLXNN
+import os
 @preconcurrency import MLXLMCommon
 import Tokenizers
+
+let chatterboxLogger = Logger(subsystem: "mlx-audio", category: "chatterbox")
 
 func resolveChatterboxEmotionAdv(default value: MLXArray, override: Float?) -> MLXArray {
     override.map { MLXArray(Float($0)) } ?? value
@@ -509,22 +513,12 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
 
     // MARK: - Reference Audio Processing
 
-    /// Process reference audio to extract speaker embedding and prompt tokens.
-    /// Conditioning result from reference audio processing.
-    struct RefAudioConditioning {
-        let t3Cond: T3Cond
-        /// S3Gen x-vector (speaker embedding for flow decoder)
-        let xVector: MLXArray
-        /// S3Gen prompt tokens (speech tokens for flow encoder input)
-        let s3genPromptToken: MLXArray
-        /// S3Gen prompt mel features (mel spectrogram for flow conditioning)
-        let s3genPromptFeat: MLXArray
-    }
-
-    func prepareConditionals(
+    /// Computes the conditioning for a reference clip. Reusable across `generate` calls and storable
+    /// via `ChatterboxConditionals.save(to:)`.
+    public func prepareConditionals(
         refAudio: MLXArray,
-        refAudioSR: Int = 24000
-    ) throws -> RefAudioConditioning {
+        sampleRate refAudioSR: Int
+    ) throws -> ChatterboxConditionals {
         var audio = refAudio
         if audio.ndim > 1 {
             audio = audio.mean(axis: 0)
@@ -535,7 +529,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         // This ensures consistent conditioning strength regardless of input volume.
         if config.isTurbo {
             audio = normalizeLoudness(audio, targetLUFS: -27.0)
-            print("[Chatterbox]   Loudness normalized to -27 LUFS")
+            chatterboxLogger.debug("Loudness normalized to -27 LUFS")
         }
 
         // --- Audio at different sample rates ---
@@ -569,7 +563,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         // --- 1. VoiceEncoder: 256-dim speaker embedding for T3 ---
         // Trim silence before computing speaker embedding (matches Python librosa.effects.trim)
         let audio16kTrimmed = trimSilence(audio16kEnc, topDb: 20.0)
-        print("[Chatterbox]   VoiceEncoder: trimmed \(audio16kEnc.dim(0)) → \(audio16kTrimmed.dim(0)) samples")
+        chatterboxLogger.debug("VoiceEncoder: trimmed \(audio16kEnc.dim(0)) → \(audio16kTrimmed.dim(0)) samples")
         let veMels = voiceEncoderMelSpectrogram(audio16kTrimmed, isTurbo: config.isTurbo)
         let veMelsTransposed = veMels.transposed().expandedDimensions(axis: 0)
         let speakerEmb = voiceEncoder.inference(
@@ -602,10 +596,10 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             // No eval() here — defer to single eval below
             s3genPromptToken = s3genTokens
 
-            print("[Chatterbox]   S3TokenizerV2: T3 tokens \(t3PromptSpeechTokens.shape) (plen=\(plen)), S3Gen tokens \(s3genPromptToken.shape)")
+            chatterboxLogger.debug("S3TokenizerV2: T3 tokens \(t3PromptSpeechTokens.shape) (plen=\(plen)), S3Gen tokens \(s3genPromptToken.shape)")
         } else {
             // Fallback: use default conditioning tokens
-            print("[Chatterbox]   S3TokenizerV2 not loaded — falling back to defaults")
+            chatterboxLogger.debug("S3TokenizerV2 not loaded — falling back to defaults")
             if let defaultTokens = defaultConditioning?.condPromptSpeechTokens,
                defaultTokens.dim(1) > 0 {
                 t3PromptSpeechTokens = defaultTokens
@@ -632,8 +626,8 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         if s3Tokenizer != nil {
             eval(t3PromptSpeechTokens, s3genPromptToken)
         }
-        print("[Chatterbox]   VoiceEncoder: speakerEmb \(speakerEmb.shape)")
-        print("[Chatterbox]   CAMPPlus: xVector \(xVector.shape)")
+        chatterboxLogger.debug("VoiceEncoder: speakerEmb \(speakerEmb.shape)")
+        chatterboxLogger.debug("CAMPPlus: xVector \(xVector.shape)")
 
         // --- 5. Align token count and mel frame count ---
         // Invariant: mel_frames = 2 * num_tokens (token_mel_ratio = 2)
@@ -656,22 +650,19 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
                     promptToken = promptToken[0..., ..<maxTokens]
                 }
             }
-            print("[Chatterbox]   Aligned: promptToken \(promptToken.shape), promptFeat \(promptFeat.shape)")
+            chatterboxLogger.debug("Aligned: promptToken \(promptToken.shape), promptFeat \(promptFeat.shape)")
         }
 
-        // Build T3Cond
-        let t3Cond = T3Cond(
-            speakerEmb: speakerEmb,
-            condPromptSpeechTokens: t3PromptSpeechTokens.dim(1) > 0 ? t3PromptSpeechTokens : nil,
-            condPromptSpeechEmb: nil,
-            emotionAdv: MLXArray(Float(emotionAdvOverride ?? 0.5))
-        )
+        // s3genPromptFeat is (1, 80, T'); generation consumes (1, T', 80).
+        let promptFeatBTC = promptFeat.transposed(0, 2, 1)
+        eval(promptToken, promptFeatBTC)
 
-        return RefAudioConditioning(
-            t3Cond: t3Cond,
+        return ChatterboxConditionals(
+            speakerEmb: speakerEmb,
+            t3PromptSpeechTokens: t3PromptSpeechTokens,
             xVector: xVector,
             s3genPromptToken: promptToken,
-            s3genPromptFeat: promptFeat
+            s3genPromptFeat: promptFeatBTC
         )
     }
 
@@ -711,46 +702,89 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         language: String?,
         generationParameters: GenerateParameters
     ) async throws -> sending MLXArray {
-        // Use reference audio, or fall back to default conditioning
-        let t3Cond: T3Cond
-        let xVector: MLXArray
-        let promptTokens: MLXArray
-        let promptFeat: MLXArray
+        let conditionals: ChatterboxConditionals
+        let emotionAdv: MLXArray
 
         if let refAudio = refAudio {
-            print("[Chatterbox] Processing reference audio (shape: \(refAudio.shape))...")
+            chatterboxLogger.debug("Processing reference audio (shape: \(refAudio.shape))...")
             let condStart = CFAbsoluteTimeGetCurrent()
-            let refCond = try prepareConditionals(refAudio: refAudio)
-            print("[Chatterbox] Conditioning prepared in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - condStart))s")
-            print("[Chatterbox]   speakerEmb: \(refCond.t3Cond.speakerEmb.shape), s3genPromptToken: \(refCond.s3genPromptToken.shape), s3genPromptFeat: \(refCond.s3genPromptFeat.shape), xVector: \(refCond.xVector.shape)")
-            t3Cond = refCond.t3Cond
-            xVector = refCond.xVector
-            promptTokens = refCond.s3genPromptToken
-            promptFeat = refCond.s3genPromptFeat
+            conditionals = try prepareConditionals(refAudio: refAudio, sampleRate: 24000)
+            chatterboxLogger.debug("Conditioning prepared in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - condStart))s")
+            emotionAdv = MLXArray(Float(emotionAdvOverride ?? 0.5))
         } else if let defaults = defaultConditioning {
-            // Use pre-computed default voice
-            t3Cond = T3Cond(
+            // Pre-computed default voice
+            conditionals = ChatterboxConditionals(
                 speakerEmb: defaults.speakerEmb,
-                condPromptSpeechTokens: defaults.condPromptSpeechTokens,
-                condPromptSpeechEmb: nil,
-                emotionAdv: resolveChatterboxEmotionAdv(
-                    default: defaults.emotionAdv, override: emotionAdvOverride)
+                t3PromptSpeechTokens: defaults.condPromptSpeechTokens,
+                xVector: defaults.xVector,
+                s3genPromptToken: defaults.promptToken,
+                // Default conds may store (B, 80, T') instead of (B, T', 80).
+                s3genPromptFeat: defaults.promptFeat.ndim == 3 && defaults.promptFeat.dim(1) == 80
+                    ? defaults.promptFeat.transposed(0, 2, 1) : defaults.promptFeat
             )
-            xVector = defaults.xVector
-            promptTokens = defaults.promptToken
-            promptFeat = defaults.promptFeat
+            emotionAdv = resolveChatterboxEmotionAdv(
+                default: defaults.emotionAdv, override: emotionAdvOverride)
         } else {
             throw AudioGenerationError.invalidInput(
                 "Chatterbox requires reference audio for voice cloning. Pass refAudio parameter."
             )
         }
 
+        return try await generateCore(
+            text: text,
+            language: language,
+            conditionals: conditionals,
+            emotionAdv: emotionAdv,
+            temperature: generationParameters.temperature,
+            topP: generationParameters.topP,
+            cfgWeight: cfgWeightOverride ?? 0.5,
+            normalizePeak: true
+        )
+    }
+
+    /// Generates speech from precomputed reference conditioning, with per-call settings.
+    public func generate(
+        text: String,
+        language: String?,
+        conditionals: ChatterboxConditionals,
+        options: ChatterboxGenerationOptions = .init()
+    ) async throws -> sending MLXArray {
+        try await generateCore(
+            text: text,
+            language: language,
+            conditionals: conditionals,
+            emotionAdv: MLXArray(options.exaggeration),
+            temperature: options.temperature,
+            topP: defaultGenerationParameters.topP,
+            cfgWeight: options.cfgWeight,
+            normalizePeak: options.normalizePeak
+        )
+    }
+
+    private func generateCore(
+        text: String,
+        language: String?,
+        conditionals: ChatterboxConditionals,
+        emotionAdv: MLXArray,
+        temperature: Float,
+        topP: Float,
+        cfgWeight: Float,
+        normalizePeak: Bool
+    ) async throws -> sending MLXArray {
+        let t3Cond = T3Cond(
+            speakerEmb: conditionals.speakerEmb,
+            condPromptSpeechTokens: conditionals.t3PromptSpeechTokens.dim(1) > 0
+                ? conditionals.t3PromptSpeechTokens : nil,
+            condPromptSpeechEmb: nil,
+            emotionAdv: emotionAdv
+        )
+        let xVector = conditionals.xVector
+        let promptTokens = conditionals.s3genPromptToken
+        let promptFeat = conditionals.s3genPromptFeat
+
         // Tokenize text
         let textTokens = try tokenizeText(text, language: language)
-        print("[Chatterbox] Text tokenized: \(textTokens.shape)")
-
-        let temperature = generationParameters.temperature
-        let topP = generationParameters.topP
+        chatterboxLogger.debug("Text tokenized: \(textTokens.shape)")
 
         // Cap max tokens: when using reference audio without prompt speech tokens,
         // the model may not generate EOS reliably, so use a smaller limit.
@@ -764,10 +798,10 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             // Estimate: ~10 speech tokens per text token, with min 200, max 768
             let textLen = textTokens.dim(textTokens.ndim - 1)
             maxTokens = min(768, max(200, textLen * 10))
-            print("[Chatterbox] No prompt speech tokens — capping maxTokens to \(maxTokens) (text length: \(textLen))")
+            chatterboxLogger.debug("No prompt speech tokens — capping maxTokens to \(maxTokens) (text length: \(textLen))")
         }
 
-        print("[Chatterbox] Stage 1: T3 text→speech tokens (maxTokens=\(maxTokens))")
+        chatterboxLogger.debug("Stage 1: T3 text→speech tokens (maxTokens=\(maxTokens))")
         let t3Start = CFAbsoluteTimeGetCurrent()
         // Stage 1: T3 — generate speech tokens
         var t3CondMut = t3Cond
@@ -796,14 +830,14 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
                 topP: 1.0,
                 minP: 0.05,
                 repetitionPenalty: 1.2,
-                cfgWeight: cfgWeightOverride ?? 0.5
+                cfgWeight: cfgWeight
             )
         } else {
             throw AudioGenerationError.modelNotInitialized("Unknown T3 model type")
         }
         try Task.checkCancellation()
         eval(speechTokens)
-        print("[Chatterbox] Stage 1 complete: \(speechTokens.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t3Start))s")
+        chatterboxLogger.debug("Stage 1 complete: \(speechTokens.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - t3Start))s")
 
         // Post-process: remove OOV tokens and append silence
         let cleanTokens = dropInvalidTokens(speechTokens)
@@ -816,36 +850,25 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         let tokenLen = MLXArray([Int32(tokenArr.dim(1))])
         let promptTokenLen = MLXArray([Int32(promptTokens.dim(1))])
 
-        // Prepare prompt mel features for S3Gen conditioning
-        // s3genMelSpectrogram returns (B, 80, T') — transpose to (B, T', 80) for inference
-        let promptFeatTransposed: MLXArray
-        if promptFeat.dim(1) == 80 && promptFeat.ndim == 3 {
-            // Shape is (B, 80, T') — transpose to (B, T', 80)
-            promptFeatTransposed = promptFeat.transposed(0, 2, 1)
-        } else {
-            // Already (B, T', 80) or some other shape
-            promptFeatTransposed = promptFeat
-        }
-
         // Run flow matching inference with raw int32 token IDs
         // Meanflow (turbo distilled): 2 steps. Non-meanflow (regular): 10 steps.
         let nTimesteps = config.meanflow ? 2 : 10
-        print("[Chatterbox] Stage 2: S3Gen speech tokens→mel (nTimesteps=\(nTimesteps), tokens=\(tokenArr.shape))")
+        chatterboxLogger.debug("Stage 2: S3Gen speech tokens→mel (nTimesteps=\(nTimesteps), tokens=\(tokenArr.shape))")
         let s3Start = CFAbsoluteTimeGetCurrent()
         let mel = s3gen.inference(
             token: tokenArr,
             tokenLen: tokenLen,
             promptToken: promptTokens,
             promptTokenLen: promptTokenLen,
-            promptFeat: promptFeatTransposed,
+            promptFeat: promptFeat,
             embedding: xVector,
             nTimesteps: nTimesteps
         )
         try Task.checkCancellation()
         eval(mel)
-        print("[Chatterbox] Stage 2 complete: mel \(mel.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - s3Start))s")
+        chatterboxLogger.debug("Stage 2 complete: mel \(mel.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - s3Start))s")
 
-        print("[Chatterbox] Stage 3: Vocoder mel→waveform")
+        chatterboxLogger.debug("Stage 3: Vocoder mel→waveform")
         let vocStart = CFAbsoluteTimeGetCurrent()
         // Vocoder: mel → waveform via HiFi-GAN
         var (waveform, _) = s3gen.vocoder(mel)
@@ -874,13 +897,16 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         // Peak-normalize output to ensure audible volume.
         // The vocoder output can be quiet depending on conditioning strength.
         // Scale so peak amplitude is ~0.95 (standard headroom for speech).
-        let peak = MLX.abs(waveform).max().item(Float.self)
-        if peak > 1e-6 {
-            let targetPeak: Float = 0.95
-            waveform = waveform * MLXArray(targetPeak / peak)
+        // Callers stitching chunks pass normalizePeak: false to keep relative levels.
+        if normalizePeak {
+            let peak = MLX.abs(waveform).max().item(Float.self)
+            if peak > 1e-6 {
+                let targetPeak: Float = 0.95
+                waveform = waveform * MLXArray(targetPeak / peak)
+            }
         }
 
-        print("[Chatterbox] Stage 3 complete: waveform \(waveform.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - vocStart))s")
+        chatterboxLogger.debug("Stage 3 complete: waveform \(waveform.shape) in \(String(format: "%.2f", CFAbsoluteTimeGetCurrent() - vocStart))s")
         return waveform
     }
 
@@ -960,6 +986,20 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         _ modelDir: URL,
         hfToken: String?
     ) async throws -> ChatterboxModel {
+        try await fromModelDirectory(modelDir, s3TokenizerDirectory: nil, hfToken: hfToken)
+    }
+
+    /// Loads from a local folder. With `s3TokenizerDirectory` set, the S3 tokenizer comes from that
+    /// folder (failure throws) and nothing touches the network; with nil, it is fetched from the Hub.
+    /// Never writes into `modelDir` unless a Turbo repo lacks `tokenizer.json`.
+    public static func fromModelDirectory(
+        _ modelDir: URL,
+        s3TokenizerDirectory: URL?,
+        hfToken: String?
+    ) async throws -> ChatterboxModel {
+        // Fail fast, before the multi-GB weight load.
+        let localS3Tokenizer = try s3TokenizerDirectory.map { try S3TokenizerV2.fromModelDirectory($0) }
+
         // Load config
         let configURL = modelDir.appendingPathComponent("config.json")
         let config: ChatterboxConfiguration
@@ -996,7 +1036,7 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
                 restored += 1
             }
             if restored > 0 {
-                print("[Chatterbox] Restored \(restored) attn out-proj biases dropped by the checkpoint conversion")
+                chatterboxLogger.debug("Restored \(restored) attn out-proj biases dropped by the checkpoint conversion")
             }
         }
 
@@ -1019,10 +1059,10 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             let weightKeys = Set(sanitizedWeights.keys)
             let unloaded = paramKeys.subtracting(weightKeys).sorted()
             let misrouted = weightKeys.subtracting(paramKeys).sorted()
-            print("[LOAD-DEBUG] params with NO checkpoint value (\(unloaded.count)) — these keep random init:")
-            for k in unloaded { print("  UNLOADED \(k)") }
-            print("[LOAD-DEBUG] checkpoint keys matching NO param (\(misrouted.count)) — these are dropped:")
-            for k in misrouted { print("  DROPPED \(k)") }
+            chatterboxLogger.debug("[LOAD-DEBUG] params with NO checkpoint value (\(unloaded.count)) — these keep random init:")
+            for k in unloaded { chatterboxLogger.debug("  UNLOADED \(k)") }
+            chatterboxLogger.debug("[LOAD-DEBUG] checkpoint keys matching NO param (\(misrouted.count)) — these are dropped:")
+            for k in misrouted { chatterboxLogger.debug("  DROPPED \(k)") }
         }
         try model.update(parameters: ModuleParameters.unflattened(sanitizedWeights), verify: [])
 
@@ -1053,19 +1093,20 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
             }
         }
 
-        // Regular: has tokenizer.json but missing tokenizer_config.json — generate minimal config
-        let tokenizerConfigPath = modelDir.appendingPathComponent("tokenizer_config.json")
-        if !FileManager.default.fileExists(atPath: tokenizerConfigPath.path) {
-            let minimalConfig: [String: Any] = ["tokenizer_class": "GPT2Tokenizer"]
-            let data = try JSONSerialization.data(withJSONObject: minimalConfig)
-            try data.write(to: tokenizerConfigPath)
-        }
-
-        // Load tokenizer
+        // Built in memory: modelDir may be read-only and Regular repos ship no tokenizer_config.json.
         do {
-            model.tokenizer = try await AutoTokenizer.from(modelFolder: modelDir)
+            let hub = HubApi.shared
+            let tokenizerData = try hub.configuration(fileURL: tokenizerJsonPath)
+            let tokenizerConfigPath = modelDir.appendingPathComponent("tokenizer_config.json")
+            var tokenizerConfig = FileManager.default.fileExists(atPath: tokenizerConfigPath.path)
+                ? (try hub.configuration(fileURL: tokenizerConfigPath).dictionary(or: [:])) : [:]
+            if tokenizerConfig["tokenizer_class"]?.string() == nil {
+                tokenizerConfig["tokenizer_class"] = Config("GPT2Tokenizer")
+            }
+            model.tokenizer = try AutoTokenizer.from(
+                tokenizerConfig: Config(tokenizerConfig), tokenizerData: tokenizerData)
         } catch {
-            print("Warning: Could not load tokenizer from model folder: \(error)")
+            chatterboxLogger.warning("Could not load tokenizer from model folder: \(error)")
         }
 
         // Load default voice conditioning (conds.safetensors)
@@ -1086,21 +1127,25 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
                 eval(model.defaultConditioning!.speakerEmb)
                 eval(model.defaultConditioning!.xVector)
             } catch {
-                print("Warning: Could not load default conditioning from conds.safetensors: \(error)")
+                chatterboxLogger.warning("Warning: Could not load default conditioning from conds.safetensors: \(error)")
             }
         }
 
-        // Load S3TokenizerV2 from separate HuggingFace repo (needed for voice cloning)
-        let s3TokenizerRepo = "mlx-community/S3TokenizerV2"
-        do {
-            model.s3Tokenizer = try await S3TokenizerV2.fromPretrained(
-                s3TokenizerRepo,
-                hfToken: hfToken
-            )
-            print("[Chatterbox] Loaded S3TokenizerV2 from \(s3TokenizerRepo)")
-        } catch {
-            print("Warning: Could not load S3TokenizerV2: \(error)")
-            print("  Voice cloning will fall back to default conditioning tokens.")
+        // S3TokenizerV2 lives in its own repo (needed for voice cloning)
+        if let localS3Tokenizer {
+            model.s3Tokenizer = localS3Tokenizer
+        } else {
+            let s3TokenizerRepo = "mlx-community/S3TokenizerV2"
+            do {
+                model.s3Tokenizer = try await S3TokenizerV2.fromPretrained(
+                    s3TokenizerRepo,
+                    hfToken: hfToken
+                )
+                chatterboxLogger.debug("Loaded S3TokenizerV2 from \(s3TokenizerRepo)")
+            } catch {
+                chatterboxLogger.warning("Could not load S3TokenizerV2: \(error)")
+                chatterboxLogger.warning("Voice cloning will fall back to default conditioning tokens.")
+            }
         }
 
         return model

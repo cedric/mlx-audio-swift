@@ -8,6 +8,7 @@
 //
 
 import Foundation
+import os
 import Tokenizers
 
 /// Language codes accepted by the multilingual checkpoints.
@@ -93,7 +94,7 @@ struct ChatterboxCangjieConverter: Sendable {
                 codeToWords[parts[1], default: []].append(word)
             }
         } catch {
-            print("Warning: Could not load Cangjie mapping: \(error)")
+            chatterboxLogger.warning("Warning: Could not load Cangjie mapping: \(error)")
         }
         self.wordToCode = wordToCode
         self.codeToWords = codeToWords

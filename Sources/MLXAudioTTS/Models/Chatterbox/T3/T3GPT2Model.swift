@@ -11,6 +11,7 @@ import Foundation
 import MLX
 import MLXFast
 import MLXNN
+import os
 @preconcurrency import MLXLMCommon
 
 // MARK: - GPT-2 Attention
@@ -312,7 +313,7 @@ public class T3GPT2Model: Module {
 
         var generatedIds = [Int]()
 
-        print("[T3-Turbo] Starting generation (maxNewTokens=\(maxNewTokens), temp=\(temperature), topK=\(topK), topP=\(topP))")
+        chatterboxLogger.debug("[T3-Turbo] Starting generation (maxNewTokens=\(maxNewTokens), temp=\(temperature), topK=\(topK), topP=\(topP))")
         let genStart = CFAbsoluteTimeGetCurrent()
 
         // Generation loop
@@ -333,14 +334,14 @@ public class T3GPT2Model: Module {
             // Check EOS
             if nextTokenId == hp.stopSpeechToken {
                 let elapsed = CFAbsoluteTimeGetCurrent() - genStart
-                print("[T3-Turbo] EOS at step \(step)/\(maxNewTokens) (\(generatedIds.count) tokens, \(String(format: "%.2f", elapsed))s)")
+                chatterboxLogger.debug("[T3-Turbo] EOS at step \(step)/\(maxNewTokens) (\(generatedIds.count) tokens, \(String(format: "%.2f", elapsed))s)")
                 break
             }
             generatedIds.append(nextTokenId)
 
             if step % 100 == 0 && step > 0 {
                 let elapsed = CFAbsoluteTimeGetCurrent() - genStart
-                print("[T3-Turbo] Step \(step)/\(maxNewTokens) (\(generatedIds.count) tokens, \(String(format: "%.2f", elapsed))s)")
+                chatterboxLogger.debug("[T3-Turbo] Step \(step)/\(maxNewTokens) (\(generatedIds.count) tokens, \(String(format: "%.2f", elapsed))s)")
             }
 
             // Embed next token for next step
@@ -353,7 +354,7 @@ public class T3GPT2Model: Module {
         }
 
         let totalElapsed = CFAbsoluteTimeGetCurrent() - genStart
-        print("[T3-Turbo] Generation complete: \(generatedIds.count) tokens in \(String(format: "%.2f", totalElapsed))s")
+        chatterboxLogger.debug("[T3-Turbo] Generation complete: \(generatedIds.count) tokens in \(String(format: "%.2f", totalElapsed))s")
         return MLXArray(generatedIds.map { Int32($0) }).reshaped([1, -1])
     }
 }
