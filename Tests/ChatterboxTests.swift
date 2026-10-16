@@ -266,6 +266,63 @@ struct ChatterboxResampleTests {
     }
 }
 
+@Suite("Chatterbox T3 override tests")
+struct ChatterboxT3OverrideTests {
+    private let base: [String: MLXArray] = [
+        "t3.tfmr.model.layers.0.self_attn.q_proj.weight": MLXArray.zeros([2, 2]),
+        "t3.tfmr.model.norm.weight": MLXArray.zeros([2]),
+        "t3.speech_emb.weight": MLXArray.zeros([3, 2]),
+        "s3gen.flow.weight": MLXArray.zeros([1]),
+    ]
+
+    @Test func renamesResembleKeysAndKeepsTheRest() throws {
+        let merged = try replacingT3Weights(in: base, with: [
+            "tfmr.layers.0.self_attn.q_proj.weight": MLXArray.ones([2, 2]),
+            "tfmr.norm.weight": MLXArray.ones([2]),
+            "speech_emb.weight": MLXArray.ones([3, 2]),
+        ])
+        #expect(Set(merged.keys) == Set(base.keys))
+        #expect(merged["t3.tfmr.model.norm.weight"]!.sum().item(Float.self) == 2)
+        #expect(merged["s3gen.flow.weight"]!.sum().item(Float.self) == 0)
+    }
+
+    @Test func rejectsMissingKeysAndOtherShapes() {
+        #expect(throws: AudioGenerationError.self) {
+            try replacingT3Weights(in: base, with: ["tfmr.norm.weight": MLXArray.ones([2])])
+        }
+        #expect(throws: AudioGenerationError.self) {
+            try replacingT3Weights(in: base, with: [
+                "tfmr.layers.0.self_attn.q_proj.weight": MLXArray.ones([2, 3]),
+                "tfmr.norm.weight": MLXArray.ones([2]), "speech_emb.weight": MLXArray.ones([3, 2]),
+            ])
+        }
+    }
+}
+
+/// A Resemble V3 language pack's T3 file, e.g. t3_hi.safetensors; the gated test skips without it.
+private let packT3 = ProcessInfo.processInfo.environment["CHATTERBOX_PACK_T3"].map { URL(fileURLWithPath: $0) }
+
+@Suite("Chatterbox language pack tests", .enabled(if: v3ModelDir != nil && s3TokenizerDir != nil && packT3 != nil))
+struct ChatterboxLanguagePackTests {
+    @Test func aPackLoadsOverV3AndChangesOnlyT3() async throws {
+        let fixture = try await offlineFixture.value
+        let packModel = try await ChatterboxModel.fromModelDirectory(
+            try #require(v3ModelDir), s3TokenizerDirectory: try #require(s3TokenizerDir), t3Weights: try #require(packT3),
+            hfToken: nil)
+        let base = Dictionary(uniqueKeysWithValues: fixture.model.parameters().flattened())
+        let pack = Dictionary(uniqueKeysWithValues: packModel.parameters().flattened())
+        // Turbo's mixer is never loaded for Regular, so it differs between any two instances.
+        let changed = base.keys.filter {
+            !$0.hasSuffix("time_embed_mixer.weight") && !MLX.allClose(base[$0]!, pack[$0]!).item(Bool.self)
+        }
+        #expect(!changed.isEmpty)
+        #expect(changed.allSatisfy { $0.hasPrefix("t3.") })
+        // Same voice encoder, so V3 conditionals apply unchanged.
+        let audio = try await packModel.generate(text: "नमस्ते, यह एक परीक्षण है।", language: "hi", conditionals: fixture.conditionals)
+        #expect(audio.size > 24_000 / 2)
+    }
+}
+
 @Suite("Chatterbox flow noise tests")
 struct ChatterboxFlowNoiseTests {
     @Test func regularNoiseIsMLXAudioPythonsSeedZeroBuffer() throws {

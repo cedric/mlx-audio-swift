@@ -1006,10 +1006,12 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
 
     /// Loads from a local folder. With `s3TokenizerDirectory` set, the S3 tokenizer comes from that
     /// folder (failure throws) and nothing touches the network; with nil, it is fetched from the Hub.
-    /// Never writes into `modelDir` unless a Turbo repo lacks `tokenizer.json`.
+    /// `t3Weights`, a Resemble T3 state dict (e.g. a V3 single-language pack's `t3_hi.safetensors`), replaces
+    /// the folder's T3 weights. Never writes into `modelDir` unless a Turbo repo lacks `tokenizer.json`.
     public static func fromModelDirectory(
         _ modelDir: URL,
         s3TokenizerDirectory: URL?,
+        t3Weights: URL? = nil,
         hfToken: String?
     ) async throws -> ChatterboxModel {
         // Fail fast, before the multi-GB weight load.
@@ -1030,7 +1032,10 @@ public final class ChatterboxModel: Module, SpeechGenerationModel, @unchecked Se
         model.modelDir = modelDir
 
         // Load main weights
-        let weights = try loadChatterboxWeights(modelDir: modelDir)
+        var weights = try loadChatterboxWeights(modelDir: modelDir)
+        if let t3Weights {
+            weights = try replacingT3Weights(in: weights, with: MLX.loadArrays(url: t3Weights))
+        }
 
         // Sanitize weights
         var sanitizedWeights = model.sanitize(weights: weights)
@@ -1214,6 +1219,30 @@ private func chatterboxTokenizerLogMel(_ audio: MLXArray) -> MLXArray {
     var logSpec = MLX.log10(MLX.maximum(matmul(magnitudes, filters), MLXArray(Float(1e-10))))
     logSpec = MLX.maximum(logSpec, logSpec.max() - 8.0)
     return ((logSpec + 4.0) / 4.0).transposed() // (128, T')
+}
+
+// MARK: - T3 Override
+
+/// Swaps the `t3.*` weights for a Resemble T3 state dict. Resemble names the transformer `tfmr.layers…`,
+/// the MLX conversion `tfmr.model.layers…`; anything else must match the base's keys and shapes exactly,
+/// since unmatched keys would load as random init.
+func replacingT3Weights(in weights: [String: MLXArray], with t3: [String: MLXArray]) throws -> [String: MLXArray] {
+    var renamed = [String: MLXArray]()
+    for (key, value) in t3 {
+        let mlxKey = key.hasPrefix("tfmr.") && !key.hasPrefix("tfmr.model.")
+            ? "tfmr.model." + key.dropFirst("tfmr.".count) : key
+        renamed["t3." + mlxKey] = value
+    }
+    let base = weights.filter { $0.key.hasPrefix("t3.") }
+    guard Set(renamed.keys) == Set(base.keys) else {
+        let missing = Set(base.keys).subtracting(renamed.keys).sorted().prefix(3)
+        let extra = Set(renamed.keys).subtracting(base.keys).sorted().prefix(3)
+        throw AudioGenerationError.invalidInput("T3 weights don't match the model (missing \(Array(missing)), extra \(Array(extra)))")
+    }
+    for (key, value) in renamed where value.shape != base[key]!.shape {
+        throw AudioGenerationError.invalidInput("T3 weight \(key) is \(value.shape), the model has \(base[key]!.shape)")
+    }
+    return weights.filter { !$0.key.hasPrefix("t3.") }.merging(renamed) { _, new in new }
 }
 
 // MARK: - Audio Resampling
