@@ -1,4 +1,5 @@
 import Foundation
+import Hub
 import MLX
 import MLXAudioCore
 import Testing
@@ -86,17 +87,10 @@ struct ChatterboxV3TextTests {
     func tokenIdsMatchPython() async throws {
         let modelDir = try #require(v3ModelDir)
 
-        // swift-transformers needs tokenizer_config.json; the model writes a minimal one too.
-        let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("chatterbox-v3-tokenizer-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: folder) }
-        try FileManager.default.copyItem(
-            at: modelDir.appendingPathComponent("tokenizer.json"),
-            to: folder.appendingPathComponent("tokenizer.json"))
-        try JSONSerialization.data(withJSONObject: ["tokenizer_class": "GPT2Tokenizer"])
-            .write(to: folder.appendingPathComponent("tokenizer_config.json"))
-        let tokenizer = try await AutoTokenizer.from(modelFolder: folder)
+        // Built in memory like the model does: copying a HF cache snapshot's tokenizer.json copies a dangling relative symlink.
+        let tokenizerData = try HubApi.shared.configuration(fileURL: modelDir.appendingPathComponent("tokenizer.json"))
+        let tokenizer = try AutoTokenizer.from(
+            tokenizerConfig: Config(["tokenizer_class": Config("GPT2Tokenizer")]), tokenizerData: tokenizerData)
 
         for fixture in try loadV3Fixtures() {
             #expect(
