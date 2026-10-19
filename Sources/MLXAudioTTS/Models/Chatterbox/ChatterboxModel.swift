@@ -14,10 +14,9 @@ import Hub
 import HuggingFace
 @preconcurrency import MLX
 import MLXAudioCodecs
-import MLXAudioCore
 import MLXNN
 import os
-@preconcurrency import MLXLMCommon
+@preconcurrency import MLXAudioCore
 import Tokenizers
 
 let chatterboxLogger = Logger(subsystem: "mlx-audio", category: "chatterbox")

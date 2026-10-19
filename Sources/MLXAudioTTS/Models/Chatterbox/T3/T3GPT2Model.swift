@@ -12,7 +12,7 @@ import MLX
 import MLXFast
 import MLXNN
 import os
-@preconcurrency import MLXLMCommon
+@preconcurrency import MLXAudioCore
 
 // MARK: - GPT-2 Attention
 
